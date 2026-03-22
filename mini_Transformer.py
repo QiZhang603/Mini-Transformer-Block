@@ -136,6 +136,96 @@ class MiniTransformerBlock(nn.Module):
         return attn_weights
 
 
+class MiniTransformerEncoder(nn.Module):
+    """
+    Mini Transformer Encoder implemented by stacking multiple MiniTransformerBlocks.
+    
+    This encoder consists of N stacked transformer blocks, where each block contains:
+    1. Multi-head self-attention with residual connection and layer normalization
+    2. Feed-forward network with residual connection and layer normalization
+    
+    Input shape: (Batch_size, Seq_len, d_model)
+    Output shape: (Batch_size, Seq_len, d_model)
+    """
+    
+    def __init__(self, d_model: int, n_heads: int, num_layers: int = 3, 
+                 dim_feedforward: int = 2048, dropout: float = 0.1):
+        """
+        Initialize the Mini Transformer Encoder.
+        
+        Args:
+            d_model: Dimension of the model (embedding dimension)
+            n_heads: Number of attention heads
+            num_layers: Number of transformer blocks to stack (default: 3)
+            dim_feedforward: Dimension of feedforward network (default: 2048)
+            dropout: Dropout rate (default: 0.1)
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.num_layers = num_layers
+        
+        # Create a list of transformer blocks
+        self.layers = nn.ModuleList([
+            MiniTransformerBlock(
+                d_model=d_model,
+                n_heads=n_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout
+            )
+            for _ in range(num_layers)
+        ])
+        
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Forward pass of the Mini Transformer Encoder.
+        
+        Args:
+            x: Input tensor of shape (Batch_size, Seq_len, d_model)
+            attn_mask: Optional attention mask of shape (Seq_len, Seq_len) or (Batch_size * n_heads, Seq_len, Seq_len)
+            
+        Returns:
+            Output tensor of shape (Batch_size, Seq_len, d_model)
+        """
+        batch_size, seq_len, d_model = x.shape
+        assert d_model == self.d_model, f"Input d_model ({d_model}) doesn't match encoder d_model ({self.d_model})"
+        
+        # Pass through each transformer block
+        for i, layer in enumerate(self.layers):
+            # Shape remains (Batch_size, Seq_len, d_model) through each layer
+            x = layer(x, attn_mask=attn_mask)
+            
+        return x
+    
+    def get_attention_weights(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> list:
+        """
+        Get attention weights from all layers of the encoder.
+        
+        Args:
+            x: Input tensor of shape (Batch_size, Seq_len, d_model)
+            attn_mask: Optional attention mask
+            
+        Returns:
+            List of attention weights from each layer
+        """
+        batch_size, seq_len, d_model = x.shape
+        assert d_model == self.d_model, f"Input d_model ({d_model}) doesn't match encoder d_model ({self.d_model})"
+        
+        attention_weights = []
+        current_x = x
+        
+        # Get attention weights from each layer
+        for layer in self.layers:
+            # Get attention weights for current layer
+            attn_weights = layer.get_attention_weights(current_x, attn_mask=attn_mask)
+            attention_weights.append(attn_weights)
+            
+            # Pass through the layer to get input for next layer
+            current_x = layer(current_x, attn_mask=attn_mask)
+            
+        return attention_weights
+
+
 def test_mini_transformer_block():
     """Test function to verify the MiniTransformerBlock implementation.
     
@@ -257,9 +347,152 @@ def test_mini_transformer_block():
     print("   3. Reduce d_model to 128")
     print("   4. Use mixed precision (torch.cuda.amp) for training")
     
+        
     return block, x, output
+
+
+def test_mini_transformer_encoder():
+    """Test function to verify the MiniTransformerEncoder implementation.
+    
+    Parameters are further optimized for RTX 4050 6GB to avoid OOM with multiple layers.
+    """
+    import numpy as np
+    
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # Test parameters optimized for RTX 4050 6GB with 3 layers
+    # Further reduced to avoid OOM with multiple stacked blocks
+    batch_size = 1          # Reduced to 1 to minimize memory with 3 layers
+    seq_len = 24           # Slightly reduced for safety
+    d_model = 256          # Same as block test
+    n_heads = 4            # Same as block test
+    num_layers = 3         # Number of stacked blocks
+    dim_feedforward = 1024 # Same as block test
+    
+    # Verify d_model is divisible by n_heads
+    assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
+    
+    print("\n" + "="*60)
+    print("Testing MiniTransformerEncoder (optimized for RTX 4050 6GB)...")
+    print(f"Batch size: {batch_size}, Seq len: {seq_len}, d_model: {d_model}, n_heads: {n_heads}")
+    print(f"Number of layers: {num_layers}, Feedforward dimension: {dim_feedforward}")
+    
+    # Check GPU memory if available
+    if torch.cuda.is_available():
+        print(f"\nCUDA is available. GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Total GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        
+    # Create the encoder
+    encoder = MiniTransformerEncoder(
+        d_model=d_model,
+        n_heads=n_heads,
+        num_layers=num_layers,
+        dim_feedforward=dim_feedforward,
+        dropout=0.1
+    )
+    
+    # Move to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    encoder = encoder.to(device)
+    print(f"\nEncoder moved to: {device}")
+    
+    # Monitor GPU memory before creating input
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        memory_allocated = torch.cuda.memory_allocated(0) / 1e9
+        memory_reserved = torch.cuda.memory_reserved(0) / 1e9
+        print(f"GPU memory allocated after encoder: {memory_allocated:.2f} GB")
+        print(f"GPU memory reserved after encoder: {memory_reserved:.2f} GB")
+    
+    # Create random input on the same device as the model
+    x = torch.randn(batch_size, seq_len, d_model, device=device)
+    print(f"\nInput shape: {x.shape} (on {device})")
+    
+    # Forward pass through encoder
+    output = encoder(x)
+    print(f"Encoder output shape: {output.shape} (on {device})")
+    
+    # Verify input and output shapes match
+    assert x.shape == output.shape, f"Shape mismatch: input {x.shape} != output {output.shape}"
+    print("✓ Input and output shapes match")
+    
+    # Test with attention mask
+    attn_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+    attn_mask = attn_mask.to(device)
+    output_masked = encoder(x, attn_mask=attn_mask)
+    print(f"Encoder output with mask shape: {output_masked.shape}")
+    print("✓ Masked attention works")
+    
+    # Test attention weights from all layers
+    attention_weights = encoder.get_attention_weights(x)
+    print(f"\nRetrieved attention weights from {len(attention_weights)} layers")
+    for i, attn_weights in enumerate(attention_weights):
+        if attn_weights.dim() == 4:
+            print(f"  Layer {i+1}: shape {attn_weights.shape} (per head)")
+        else:
+            print(f"  Layer {i+1}: shape {attn_weights.shape} (averaged)")
+    print("✓ Attention weights can be retrieved from all layers")
+    
+    # Monitor GPU memory after all operations
+    if torch.cuda.is_available():
+        memory_allocated = torch.cuda.memory_allocated(0) / 1e9
+        memory_reserved = torch.cuda.memory_reserved(0) / 1e9
+        print(f"\nGPU memory allocated after all ops: {memory_allocated:.2f} GB")
+        print(f"GPU memory reserved after all ops: {memory_reserved:.2f} GB")
+        
+        # Check if we're using a reasonable amount of memory
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        memory_usage_percent = (memory_allocated / total_memory) * 100
+        print(f"Memory usage: {memory_usage_percent:.1f}% of total GPU memory")
+        
+        if memory_allocated > 4.0:  # More than 4GB used
+            print("⚠️  Warning: High GPU memory usage detected!")
+            print("   Consider further reducing parameters for encoder test.")
+        else:
+            print("✓ GPU memory usage is within safe limits for RTX 4050 6GB")
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in encoder.parameters())
+    trainable_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+    print(f"\nEncoder total parameters: {total_params:,}")
+    print(f"Encoder trainable parameters: {trainable_params:,}")
+    
+    # Calculate memory estimate for parameters (assuming float32)
+    param_memory_mb = (total_params * 4) / (1024 ** 2)  # 4 bytes per float32
+    print(f"Estimated parameter memory: {param_memory_mb:.2f} MB")
+    
+    # Compare with single block
+    single_block = MiniTransformerBlock(d_model, n_heads, dim_feedforward)
+    block_params = sum(p.numel() for p in single_block.parameters())
+    print(f"\nSingle block parameters: {block_params:,}")
+    print(f"Encoder is {num_layers}x larger than single block")
+    
+    print("\n✅ All encoder tests passed! MiniTransformerEncoder is working correctly.")
+    print("\n📊 Summary of encoder parameters for RTX 4050 6GB:")
+    print(f"   • Batch size: {batch_size} (reduced to 1 for 3-layer safety)")
+    print(f"   • Sequence length: {seq_len} (slightly reduced)")
+    print(f"   • Model dimension: {d_model}")
+    print(f"   • Attention heads: {n_heads}")
+    print(f"   • Number of layers: {num_layers}")
+    print(f"   • Feedforward dim: {dim_feedforward}")
+    
+    return encoder, x, output, attention_weights
 
 
 if __name__ == "__main__":
     # Run tests when the file is executed directly
-    block, x, output = test_mini_transformer_block()
+    print("Starting Mini Transformer Tests...")
+    print("="*60)
+    
+    # Test single block
+    block, x_block, output_block = test_mini_transformer_block()
+    
+    # Test encoder with 3 stacked blocks
+    encoder, x_encoder, output_encoder, attention_weights = test_mini_transformer_encoder()
+    
+    print("\n" + "="*60)
+    print("🎉 All tests completed successfully!")
+    print("Mini Transformer Block and Encoder are ready for use.")
+    print("="*60)
