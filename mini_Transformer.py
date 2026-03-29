@@ -1,6 +1,226 @@
+import math
+from typing import Dict, Optional, Tuple, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
+from torch.optim.lr_scheduler import _LRScheduler
+
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal or learnable positional encoding."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000, learnable: bool = False):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.learnable = learnable
+        self.d_model = d_model
+
+        if learnable:
+            self.pos_embed = nn.Embedding(max_len, d_model)
+        else:
+            position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+            pe = torch.zeros(max_len, d_model)
+            pe[:, 0::2] = torch.sin(position * div_term)
+            pe[:, 1::2] = torch.cos(position * div_term)
+            pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+            self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, d_model)
+        if self.learnable:
+            seq_len = x.size(1)
+            positions = torch.arange(seq_len, device=x.device, dtype=torch.long).unsqueeze(0)
+            pos = self.pos_embed(positions)
+        else:
+            pos = self.pe[:, : x.size(1)]
+        x = x + pos
+        return self.dropout(x)
+
+
+def make_padding_mask(tokens: torch.Tensor, pad_id: int) -> torch.Tensor:
+    """Return key_padding_mask (batch, seq_len) with True at padding positions."""
+    return tokens.eq(pad_id)
+
+
+def make_causal_mask(seq_len: int, device: Optional[torch.device] = None) -> torch.Tensor:
+    """Upper-triangular mask with True where future tokens should be masked."""
+    return torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+
+
+class MiniTransformerDecoderBlock(nn.Module):
+    """Pre-LN Transformer decoder block with self-attn, cross-attn, and FFN."""
+
+    def __init__(self, d_model: int, n_heads: int, dim_feedforward: int = 2048, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Self-attention (masked)
+        residual = tgt
+        tgt_norm = self.norm1(tgt)
+        attn_output, _ = self.self_attn(
+            tgt_norm,
+            tgt_norm,
+            tgt_norm,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=False,
+        )
+        tgt = residual + self.dropout1(attn_output)
+
+        # Cross-attention
+        residual = tgt
+        tgt_norm = self.norm2(tgt)
+        cross_output, _ = self.cross_attn(
+            tgt_norm,
+            memory,
+            memory,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+        )
+        tgt = residual + self.dropout2(cross_output)
+
+        # Feed-forward
+        residual = tgt
+        tgt_norm = self.norm3(tgt)
+        ffn_output = self.ffn(tgt_norm)
+        tgt = residual + self.dropout3(ffn_output)
+        return tgt
+
+    def get_attention_weights(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt_norm = self.norm1(tgt)
+        _, self_weights = self.self_attn(
+            tgt_norm,
+            tgt_norm,
+            tgt_norm,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+
+        tgt_norm = self.norm2(tgt)
+        _, cross_weights = self.cross_attn(
+            tgt_norm,
+            memory,
+            memory,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        return self_weights, cross_weights
+
+
+class MiniTransformerDecoder(nn.Module):
+    """Stacked decoder using MiniTransformerDecoderBlock."""
+
+    def __init__(self, d_model: int, n_heads: int, num_layers: int = 3, dim_feedforward: int = 2048, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.layers = nn.ModuleList(
+            [
+                MiniTransformerDecoderBlock(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            tgt = layer(
+                tgt,
+                memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+            )
+        return tgt
+
+    def get_attention_weights(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[list, list]:
+        self_weights = []
+        cross_weights = []
+        current_tgt = tgt
+        for layer in self.layers:
+            sw, cw = layer.get_attention_weights(
+                current_tgt,
+                memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+            )
+            self_weights.append(sw)
+            cross_weights.append(cw)
+            current_tgt = layer(
+                current_tgt,
+                memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+            )
+        return self_weights, cross_weights
 
 
 class MiniTransformerBlock(nn.Module):
@@ -54,13 +274,19 @@ class MiniTransformerBlock(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Forward pass of the Mini Transformer Block.
         
         Args:
             x: Input tensor of shape (Batch_size, Seq_len, d_model)
             attn_mask: Optional attention mask of shape (Seq_len, Seq_len) or (Batch_size * n_heads, Seq_len, Seq_len)
+            key_padding_mask: Optional bool mask (Batch_size, Seq_len) with True at padding positions
             
         Returns:
             Output tensor of shape (Batch_size, Seq_len, d_model)
@@ -83,6 +309,7 @@ class MiniTransformerBlock(nn.Module):
             key=x_norm,
             value=x_norm,
             attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
             need_weights=False  # Set to True if you need attention weights
         )
         
@@ -110,13 +337,19 @@ class MiniTransformerBlock(nn.Module):
         
         return x
     
-    def get_attention_weights(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+    def get_attention_weights(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Get attention weights from the self-attention layer.
         
         Args:
             x: Input tensor of shape (Batch_size, Seq_len, d_model)
             attn_mask: Optional attention mask
+            key_padding_mask: Optional bool mask (Batch_size, Seq_len)
             
         Returns:
             Attention weights of shape (Batch_size, n_heads, Seq_len, Seq_len) or (Batch_size, Seq_len, Seq_len)
@@ -129,6 +362,7 @@ class MiniTransformerBlock(nn.Module):
             key=x_norm,
             value=x_norm,
             attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
             need_weights=True,
             average_attn_weights=False  # Return attention weights per head
         )
@@ -176,13 +410,19 @@ class MiniTransformerEncoder(nn.Module):
             for _ in range(num_layers)
         ])
         
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Forward pass of the Mini Transformer Encoder.
         
         Args:
             x: Input tensor of shape (Batch_size, Seq_len, d_model)
             attn_mask: Optional attention mask of shape (Seq_len, Seq_len) or (Batch_size * n_heads, Seq_len, Seq_len)
+            key_padding_mask: Optional bool mask (Batch_size, Seq_len) with True at padding positions
             
         Returns:
             Output tensor of shape (Batch_size, Seq_len, d_model)
@@ -193,17 +433,23 @@ class MiniTransformerEncoder(nn.Module):
         # Pass through each transformer block
         for i, layer in enumerate(self.layers):
             # Shape remains (Batch_size, Seq_len, d_model) through each layer
-            x = layer(x, attn_mask=attn_mask)
+            x = layer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
             
         return x
     
-    def get_attention_weights(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> list:
+    def get_attention_weights(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> list:
         """
         Get attention weights from all layers of the encoder.
         
         Args:
             x: Input tensor of shape (Batch_size, Seq_len, d_model)
             attn_mask: Optional attention mask
+            key_padding_mask: Optional bool mask (Batch_size, Seq_len)
             
         Returns:
             List of attention weights from each layer
@@ -217,13 +463,177 @@ class MiniTransformerEncoder(nn.Module):
         # Get attention weights from each layer
         for layer in self.layers:
             # Get attention weights for current layer
-            attn_weights = layer.get_attention_weights(current_x, attn_mask=attn_mask)
+            attn_weights = layer.get_attention_weights(current_x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
             attention_weights.append(attn_weights)
             
             # Pass through the layer to get input for next layer
-            current_x = layer(current_x, attn_mask=attn_mask)
+            current_x = layer(current_x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
             
         return attention_weights
+
+
+class MiniTransformer(nn.Module):
+    """Encoder-Decoder Transformer with embeddings, positional encoding, and output head."""
+
+    def __init__(
+        self,
+        src_vocab_size: int,
+        tgt_vocab_size: int,
+        d_model: int,
+        n_heads: int,
+        num_encoder_layers: int = 3,
+        num_decoder_layers: int = 3,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        max_len: int = 512,
+        pad_id: int = 0,
+        learned_positional: bool = False,
+        tie_embeddings: bool = False,
+        share_encoder_decoder_embedding: bool = False,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.pad_id = pad_id
+
+        self.src_embed = nn.Embedding(src_vocab_size, d_model)
+        self.tgt_embed = self.src_embed if share_encoder_decoder_embedding else nn.Embedding(tgt_vocab_size, d_model)
+        self.positional_encoding = PositionalEncoding(d_model=d_model, dropout=dropout, max_len=max_len, learnable=learned_positional)
+
+        self.encoder = MiniTransformerEncoder(
+            d_model=d_model,
+            n_heads=n_heads,
+            num_layers=num_encoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+        )
+        self.decoder = MiniTransformerDecoder(
+            d_model=d_model,
+            n_heads=n_heads,
+            num_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+        )
+
+        self.output_proj = nn.Linear(d_model, tgt_vocab_size, bias=False)
+        if tie_embeddings:
+            if tgt_vocab_size != src_vocab_size:
+                raise ValueError("Tying embeddings requires src and tgt vocab sizes to match.")
+            self.output_proj.weight = self.tgt_embed.weight
+
+    def forward(
+        self,
+        src_tokens: torch.Tensor,
+        tgt_tokens: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        tgt_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        pad_id: Optional[int] = None,
+        return_attn: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, list]]]:
+        pad_id = self.pad_id if pad_id is None else pad_id
+
+        if src_key_padding_mask is None and pad_id is not None:
+            src_key_padding_mask = make_padding_mask(src_tokens, pad_id)
+        if tgt_key_padding_mask is None and pad_id is not None:
+            tgt_key_padding_mask = make_padding_mask(tgt_tokens, pad_id)
+        if tgt_mask is None:
+            tgt_mask = make_causal_mask(tgt_tokens.size(1), device=tgt_tokens.device)
+
+        src_embed = self.positional_encoding(self.src_embed(src_tokens) * math.sqrt(self.d_model))
+        tgt_embed = self.positional_encoding(self.tgt_embed(tgt_tokens) * math.sqrt(self.d_model))
+
+        memory = self.encoder(src_embed, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
+        decoder_out = self.decoder(
+            tgt_embed,
+            memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask,
+        )
+
+        logits = self.output_proj(decoder_out)
+
+        if not return_attn:
+            return logits
+
+        enc_attn = self.encoder.get_attention_weights(src_embed, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
+        dec_self_attn, dec_cross_attn = self.decoder.get_attention_weights(
+            tgt_embed,
+            memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask,
+        )
+        attn = {"encoder": enc_attn, "decoder_self": dec_self_attn, "decoder_cross": dec_cross_attn}
+        return logits, attn
+
+
+def build_training_components(model: nn.Module, lr: float = 3e-4, weight_decay: float = 0.01, pad_id: int = 0):
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.95)
+    return criterion, optimizer, scheduler
+
+
+def training_step(
+    model: MiniTransformer,
+    batch: Dict[str, torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    scheduler: Optional[_LRScheduler] = None,
+    clip_grad: float = 1.0,
+) -> float:
+    model.train()
+    optimizer.zero_grad()
+
+    src = batch["src"]
+    tgt_in = batch["tgt_in"]
+    tgt_out = batch["tgt_out"]
+
+    logits = model(src_tokens=src, tgt_tokens=tgt_in)
+    loss = criterion(logits.view(-1, logits.size(-1)), tgt_out.view(-1))
+    loss.backward()
+    if clip_grad is not None:
+        clip_grad_norm_(model.parameters(), clip_grad)
+    optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
+    return float(loss.detach().cpu())
+
+
+def test_full_transformer_forward():
+    """Lightweight shape check for full Transformer forward pass."""
+    torch.manual_seed(0)
+
+    batch_size = 2
+    src_len = 6
+    tgt_len = 5
+    vocab_size = 32
+    pad_id = 0
+
+    src = torch.randint(1, vocab_size, (batch_size, src_len))
+    tgt_in = torch.randint(1, vocab_size, (batch_size, tgt_len))
+    tgt_out = torch.randint(1, vocab_size, (batch_size, tgt_len))
+
+    model = MiniTransformer(
+        src_vocab_size=vocab_size,
+        tgt_vocab_size=vocab_size,
+        d_model=64,
+        n_heads=4,
+        num_encoder_layers=2,
+        num_decoder_layers=2,
+        dim_feedforward=128,
+        dropout=0.1,
+        max_len=64,
+        pad_id=pad_id,
+    )
+
+    logits = model(src_tokens=src, tgt_tokens=tgt_in, pad_id=pad_id)
+    assert logits.shape == (batch_size, tgt_len, vocab_size), "Logits shape mismatch"
+    loss_fn = nn.CrossEntropyLoss(ignore_index=pad_id)
+    loss = loss_fn(logits.view(-1, vocab_size), tgt_out.view(-1))
+    print(f"Full Transformer forward OK. Loss (random data): {loss.item():.4f}")
 
 
 def test_mini_transformer_block():
@@ -491,6 +901,9 @@ if __name__ == "__main__":
     
     # Test encoder with 3 stacked blocks
     encoder, x_encoder, output_encoder, attention_weights = test_mini_transformer_encoder()
+
+    # Test full encoder-decoder forward
+    test_full_transformer_forward()
     
     print("\n" + "="*60)
     print("🎉 All tests completed successfully!")
